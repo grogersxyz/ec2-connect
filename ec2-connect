@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+AWS_REGION="ap-southeast-2"
+KEY_LOCATION="$HOME/.ssh/ec2"
+AWS_PROFILE="default"
+INSTANCE="$1"
+USER="$2"
+
+# Get Instance ID
+# Lookup by ID
+RESPONSE=$(aws ec2 describe-instances --filters Name=instance-id,Values=$INSTANCE --query 'Reservations[*].Instances[*].InstanceId' \
+--output text --profile $AWS_PROFILE --region $AWS_REGION)
+if [ "$RESPONSE" ]
+then
+  INSTANCE_ID="$RESPONSE"
+else
+  # Lookup by Name
+  RESPONSE=$(aws ec2 describe-instances --filters Name=tag:Name,Values=$INSTANCE --query 'Reservations[*].Instances[*].InstanceId' --output text --profile $AWS_PROFILE --region $AWS_REGION)
+  if [ ! "$RESPONSE" ]
+  then
+    echo "Couldn't find $1 is it the correct InstanceId or Name?"
+    exit 1
+  fi
+  INSTANCE_ID="$RESPONSE"
+fi
+echo "InstanceId: $INSTANCE_ID"
+
+# Get the username
+if [ ! "$USER" ]
+then
+  USER=$(aws ec2 describe-tags --filters Name=resource-id,Values=$INSTANCE_ID Name=key,Values='ec2-connect::user' --query 'Tags[0].Value' \
+  --output text --profile $AWS_PROFILE --region $AWS_REGION)
+  if [ "$USER" == "None" ]; then
+    echo "Couldn't find an \"ec2-connect::user\" tag, please specify a name next time"
+    exit 1
+  fi
+else
+  aws ec2 create-tags --resources $INSTANCE_ID --tags Key="ec2-connect::user",Value=$USER --output text --profile $AWS_PROFILE --region $AWS_REGION
+fi
+
+# Get the public IP
+PUBLIC_IP=$(aws ec2 describe-instances --filters Name=instance-id,Values=$INSTANCE_ID --query 'Reservations[*].Instances[*].PublicIpAddress' \
+  --output text --profile $AWS_PROFILE --region $AWS_REGION)
+echo "IP: $PUBLIC_IP"
+
+# Get availability zone
+AVAILABILITY_ZONE=$(aws ec2 describe-instances --filters Name=instance-id,Values=$INSTANCE_ID --query 'Reservations[*].Instances[*].Placement.AvailabilityZone' \
+--output text --profile $AWS_PROFILE --region $AWS_REGION)
+echo "AZ: $AVAILABILITY_ZONE"
+
+# Generate a temporary key
+if [ ! -d "$KEY_LOCATION" ]; then
+  mkdir -p "$KEY_LOCATION"
+fi
+if [ -f "$KEY_LOCATION/$INSTANCE_ID" ]; then
+  yes y | ssh-keygen -q -t rsa -f "$KEY_LOCATION/$INSTANCE_ID" -N '' >/dev/null
+else
+  ssh-keygen -t rsa -f "$KEY_LOCATION/$INSTANCE_ID" -q -N ""
+fi
+
+# Upload the key
+INJECT=$(aws ec2-instance-connect send-ssh-public-key --region "$AWS_REGION" --instance-id $INSTANCE_ID --instance-os-user $USER \
+--ssh-public-key file://$KEY_LOCATION/$INSTANCE_ID.pub --availability-zone $AVAILABILITY_ZONE  --query 'Success')
+if [ "$INJECT" == "true" ]; then
+  echo "Injected: $INSTANCE_ID.pub"
+else
+  echo "Failed to inject $INSTANCE_ID.pub"
+  exit 1
+fi
+
+# Connect to the instance
+echo "Connecting to $USER@$PUBLIC_IP"
+ssh $USER@$PUBLIC_IP -i $KEY_LOCATION/$INSTANCE_ID
