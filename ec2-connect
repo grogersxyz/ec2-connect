@@ -69,10 +69,10 @@ def determine_az(logger, client, instanceid):
         exit()
 
 
-def inject_key(logger, client, instanceid, user, az):
+def inject_key(logger, client, key_location, instanceid, user, az):
     logger.debug("Creating keypair")
     key = RSA.generate(2048)
-    with open("ec2-connect-private.key", 'wb') as content_file:
+    with open(key_location+"ec2-connect-private.key", 'wb') as content_file:
         os.chmod("ec2-connect-private.key", 0o600)
         content_file.write(key.exportKey('PEM'))
     pubkey = key.publickey()
@@ -97,7 +97,7 @@ def main():
     parser.add_argument('--region', '-r', help='The AWS region the instance is in',
                         type=str, default='ap-southeast-2')
     parser.add_argument('--key-location', '-k', help='Location to store the generated keys',
-                        type=str, default='!/.ssh/ec2')
+                        type=str, default='')
     parser.add_argument('--profile', '-p', help='The AWS profile to use',
                         type=str)
     parser.add_argument("-v", "--verbose", help="Increase output verbosity",
@@ -132,13 +132,13 @@ def main():
     instance_az = determine_az(logger, ec2client, instance_id)
 
     print("Injecting the Key")
-    inject_key(logger, ec2_con_client, instance_id,
+    inject_key(logger, ec2_con_client, args.key_location, instance_id,
                instance_array[0], instance_az)
 
     # Connect to the instance
     print(f"Connecting you to {instance_array[0]}@{instance_ip}")
     os.system(
-        f'ssh {instance_array[0]}@{instance_ip} -i ec2-connect-private.key')
+        f'ssh {instance_array[0]}@{instance_ip} -i {args.key_location}ec2-connect-private.key')
 
 
 if __name__ == "__main__":
