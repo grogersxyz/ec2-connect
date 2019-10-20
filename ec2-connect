@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+
+import os
+import argparse
+import boto3
+from botocore.exceptions import ClientError
+import logging
+from Crypto.PublicKey import RSA
+
+
+def create_client(logger, region, profile, service):
+    logger.debug("Creating clients")
+    return boto3.session.Session(region_name=region, profile_name=profile).client(service)
+
+
+def determine_instance_id(logger, client, instance_string):
+    # Look up instance by tag
+    logger.debug("Getting instance by tag:Name")
+    response = client.describe_instances(Filters=[
+        {
+            'Name': 'tag:Name',
+            'Values': [instance_string]
+        },
+    ])
+    logger.debug(response)
+    if len(response['Reservations']) > 0 and len(response['Reservations'][0]['Instances']) > 0:
+        logger.debug("Found instance id")
+        return response['Reservations'][0]['Instances'][0]['InstanceId']
+
+    # Instance not found look up by instanceid
+    logger.debug("Getting instance by instanceID")
+    try:
+        response = client.describe_instances(InstanceIds=[instance_string])
+        logger.debug(response)
+        if len(response['Reservations']) > 0 and len(response['Reservations'][0]['Instances']) > 0:
+            logger.debug("Found instance id")
+            return response['Reservations'][0]['Instances'][0]['InstanceId']
+    except ClientError:
+        # Name tag and instance not found
+        logger.error(f"Instance '{instance_string}' could not be found")
+        exit()
+
+
+def determine_instance_ip(logger, client, instanceid):
+    logger.debug("Getting instance IP")
+    try:
+        response = client.describe_instances(InstanceIds=[instanceid])
+        logger.debug(response)
+        if len(response['Reservations']) > 0 and len(response['Reservations'][0]['Instances']) > 0:
+            logger.debug("Found instance ip")
+            return response['Reservations'][0]['Instances'][0]['PublicIpAddress']
+    except ClientError:
+        # Name tag and instance not found
+        logger.error(f"IP for Instance '{instanceid}' could not be found")
+        exit()
+
+
+def determine_az(logger, client, instanceid):
+    logger.debug("Getting instance availability zone")
+    try:
+        response = client.describe_instances(InstanceIds=[instanceid])
+        logger.debug(response)
+        if len(response['Reservations']) > 0 and len(response['Reservations'][0]['Instances']) > 0:
+            logger.debug("Found instance az")
+            return response['Reservations'][0]['Instances'][0]['Placement']['AvailabilityZone']
+    except ClientError:
+        # Name tag and instance not found
+        logger.error(f"AZ for Instance '{instanceid}' could not be found")
+        exit()
+
+
+def inject_key(logger, client, instanceid, user, az):
+    logger.debug("Creating keypair")
+    key = RSA.generate(2048)
+    with open("ec2-connect-private.key", 'wb') as content_file:
+        os.chmod("ec2-connect-private.key", 0o600)
+        content_file.write(key.exportKey('PEM'))
+    pubkey = key.publickey()
+    logger.debug("Injecting key")
+    response = client.send_ssh_public_key(
+        InstanceId=instanceid,
+        InstanceOSUser=user,
+        SSHPublicKey=pubkey.exportKey('OpenSSH').decode("utf-8"),
+        AvailabilityZone=az
+    )
+    if not response['Success']:
+        logger.error(f"Failed to inject key into {instanceid}")
+        exit()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Connect to an EC2 instance with EC2 Connect installed')
+
+    parser.add_argument(
+        'instance', help='The instance name or id and user, in the format user@instance', type=str)
+    parser.add_argument('--region', '-r', help='The AWS region the instance is in',
+                        type=str, default='ap-southeast-2')
+    parser.add_argument('--key-location', '-k', help='Location to store the generated keys',
+                        type=str, default='!/.ssh/ec2')
+    parser.add_argument('--profile', '-p', help='The AWS profile to use',
+                        type=str)
+    parser.add_argument("-v", "--verbose", help="Increase output verbosity",
+                        action="store_true")
+
+    args = parser.parse_args()
+
+    # Set logging level
+    logger = logging.getLogger("ec2-connect")
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter('%(levelname)s:%(name)s:%(message)s'))
+    logger.addHandler(ch)
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+        logger.debug("Logging level set to DEBUG")
+    else:
+        logger.setLevel(logging.WARN)
+        logger.debug("Logging level set to WARN")
+
+    print("Gathering Information")
+
+    # Create client
+    ec2client = create_client(logger, args.region, args.profile, 'ec2')
+    ec2_con_client = create_client(
+        logger, args.region, args.profile, 'ec2-instance-connect')
+
+    # Extract username and instance_id/name
+    instance_array = str(args.instance).split('@')
+
+    instance_id = determine_instance_id(logger, ec2client, instance_array[1])
+    instance_ip = determine_instance_ip(logger, ec2client, instance_id)
+    instance_az = determine_az(logger, ec2client, instance_id)
+
+    print("Injecting the Key")
+    inject_key(logger, ec2_con_client, instance_id,
+               instance_array[0], instance_az)
+
+    # Connect to the instance
+    print(f"Connecting you to {instance_array[0]}@{instance_ip}")
+    os.system(
+        f'ssh {instance_array[0]}@{instance_ip} -i ec2-connect-private.key')
+
+
+if __name__ == "__main__":
+    main()
